@@ -54,31 +54,31 @@ class HomeHeader extends StatelessWidget {
                     ),
                   ],
                 ),
-                Row(
-                  children: [
-                    if (templateId == 7)
-                      Padding(
-                        padding: EdgeInsets.only(right: 12.w),
-                        child: CircleAvatar(
-                          radius: 22.r,
-                          backgroundColor: Colors.white,
-                          backgroundImage:
-                              const AssetImage('assets/images/zamalik.jpeg'),
+                if (templateId == 7)
+                  Padding(
+                    padding: EdgeInsets.only(right: 12.w),
+                    child: Container(
+                      padding: EdgeInsets.all(2.w),
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: [Colors.blueAccent, Colors.purpleAccent],
                         ),
                       ),
-                    Container(
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.2),
-                        shape: BoxShape.circle,
-                      ),
-                      child: IconButton(
-                        icon: const Icon(Icons.notifications_outlined,
-                            color: Colors.white),
-                        onPressed: () {},
+                      child: Container(
+                        width: 44.r,
+                        height: 44.r,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.grey.shade200,
+                          image: const DecorationImage(
+                            image: AssetImage('assets/images/zamalik.jpeg'),
+                            fit: BoxFit.contain,
+                          ),
+                        ),
                       ),
                     ),
-                  ],
-                ),
+                  )
               ],
             ),
           ],
