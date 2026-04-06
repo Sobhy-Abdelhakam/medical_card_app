@@ -27,17 +27,17 @@ const Duration _animationDuration = Duration(milliseconds: 300);
 const Duration _debounceDuration = Duration(milliseconds: 400);
 
 // Use slightly larger icons for better visibility on high-DPI screens
-const double _iconSizeNormal = 30.0;
-const double _iconSizeSelected = 35.0;
+const double _iconSizeNormal = 45.0;
+const double _iconSizeSelected = 50.0;
 const double _iconBorderWidth = 1.0;
 
 Map<String, Map<String, dynamic>> _typeIconMap = {
   'صيدلية': {'icon': Icons.local_pharmacy, 'color': Colors.green},
   'مستشفى': {'icon': Icons.local_hospital, 'color': Colors.red},
-  'معامل التحاليل': {'icon': Icons.science, 'color': Colors.blue},
-  'مراكز الأشعة': {'icon': Icons.medical_services, 'color': Colors.deepPurple},
+  'معمل تحاليل': {'icon': Icons.science, 'color': Colors.blue},
+  'مركز أشعة': {'icon': Icons.medical_services, 'color': Colors.deepPurple},
   'علاج طبيعي': {'icon': Icons.accessibility_new, 'color': Colors.orange},
-  'مراكز متخصصة': {'icon': Icons.star, 'color': Colors.teal},
+  'مركز متخصص': {'icon': Icons.star, 'color': Colors.teal},
   'عيادة': {'icon': Icons.local_hospital, 'color': Colors.pink},
   'بصريات': {'icon': Icons.visibility, 'color': Colors.brown},
 };
@@ -95,22 +95,69 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     _markersNotifier = ValueNotifier<Set<Marker>>(const {});
 
     _initializeApp();
+
+    // Fetch location AFTER first frame is rendered (non-blocking)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _fetchLocationPostFrame();
+    });
   }
 
   Future<void> _initializeApp() async {
-    _locationPermissionGranted = await LocationService.requestLocationPermission();
+    // Request permission in background without blocking UI
+    final permissionStatus = await LocationService.requestLocationPermission();
+    _locationPermissionGranted =
+        permissionStatus == LocationPermissionStatus.granted;
     _startParallelInitialization();
   }
 
   void _startParallelInitialization() {
+    // Generate icons asynchronously in background
     _iconCache.generateTypeIcons(_typeIconMap).then((_) {
       if (mounted) setState(() => _areIconsReady = true);
     });
 
+    // Load map providers in background
     _cubit.loadMapProviders();
+  }
 
-    if (_locationPermissionGranted) {
-      _getCurrentLocation(animate: false);
+  /// Fetch location after UI is fully rendered (non-blocking)
+  Future<void> _fetchLocationPostFrame() async {
+    if (!mounted) return;
+    if (!_locationPermissionGranted) return;
+
+    setState(() => _isLocationLoading = true);
+
+    try {
+      // This won't block UI - location fetch happens in background
+      final location = await LocationService.getCurrentLocation();
+
+      if (!mounted) return;
+
+      setState(() => _isLocationLoading = false);
+
+      if (location != null) {
+        setState(() => _currentLocation = location);
+        // Safe camera animation (only if controller is ready)
+        if (_mapController != null) {
+          _animateCameraToLocation(location);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isLocationLoading = false);
+      }
+    }
+  }
+
+  /// Safely animate camera to location
+  void _animateCameraToLocation(LatLng location) {
+    try {
+      _mapController.animateCamera(
+        CameraUpdate.newLatLngZoom(location, 15.0),
+      );
+    } catch (e) {
+      // Silently handle animation errors (controller might be disposed)
+      debugPrint('Camera animation error: $e');
     }
   }
 
@@ -126,24 +173,41 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  // --- Location Logic ---
-
   Future<void> _getCurrentLocation({bool animate = false}) async {
     if (!mounted || !_locationPermissionGranted) return;
     setState(() => _isLocationLoading = true);
 
     try {
       final loc = await LocationService.getCurrentLocation();
-      if (mounted) {
-        setState(() {
-          _isLocationLoading = false;
-          if (loc != null) _currentLocation = loc;
-        });
-      }
+
+      if (!mounted) return;
+
+      setState(() {
+        _isLocationLoading = false;
+        if (loc != null) _currentLocation = loc;
+      });
+
+    if (loc != null && animate) {
+      _moveCameraToLocation(loc);
+    }
     } catch (_) {
       if (mounted) setState(() => _isLocationLoading = false);
     }
   }
+  Future<void> _moveCameraToLocation(LatLng location) async {
+  try {
+    await _mapController.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(
+          target: location,
+          zoom: 16,
+        ),
+      ),
+    );
+  } catch (_) {
+    // ignore (controller not ready or disposed)
+  }
+}
 
   // --- Search Logic ---
 
@@ -176,7 +240,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     const zoomPadding = 0.15;
     final distance = 40000 / pow(2, position.zoom);
     final latOffset = distance / 111.0;
-    final lngOffset = distance / (111.0 * cos(position.target.latitude * pi / 180));
+    final lngOffset =
+        distance / (111.0 * cos(position.target.latitude * pi / 180));
 
     return LatLngBounds(
       southwest: LatLng(
@@ -192,7 +257,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
 
   bool _isProviderVisible(ProviderEntity provider) {
     if (_visibleBounds == null) return true;
-    final markerLatLng = LatLng(provider.latitude ?? 0, provider.longitude ?? 0);
+    final markerLatLng =
+        LatLng(provider.latitude ?? 0, provider.longitude ?? 0);
     return _visibleBounds!.contains(markerLatLng);
   }
 
@@ -204,7 +270,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
 
   // --- Marker Rendering ---
 
-  void _scheduleMarkerBatch(List<ProviderEntity> providers, ProviderEntity? selected) {
+  void _scheduleMarkerBatch(
+      List<ProviderEntity> providers, ProviderEntity? selected) {
     _batchTimer?.cancel();
 
     if (providers.isEmpty) {
@@ -222,7 +289,9 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
       }
 
       final int start = _batchIndex;
-      final int end = (start + _batchSize < providers.length) ? start + _batchSize : providers.length;
+      final int end = (start + _batchSize < providers.length)
+          ? start + _batchSize
+          : providers.length;
 
       if (start >= providers.length) {
         timer.cancel();
@@ -246,7 +315,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     return _markerCache.putIfAbsent(cacheKey, () {
       final type = provider.type;
       final icon = isSelected
-          ? (_iconCache.getSelectedIcon(type) ?? _iconCache.getDefaultSelectedIcon())
+          ? (_iconCache.getSelectedIcon(type) ??
+              _iconCache.getDefaultSelectedIcon())
           : (_iconCache.getIcon(type) ?? _iconCache.getDefaultIcon());
 
       return Marker(
@@ -296,7 +366,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
                               child: LinearProgressIndicator(
                                 minHeight: 2.h,
                                 backgroundColor: Colors.transparent,
-                                valueColor: AlwaysStoppedAnimation(Theme.of(context).primaryColor),
+                                valueColor: AlwaysStoppedAnimation(
+                                    Theme.of(context).primaryColor),
                               ),
                             );
                           }
@@ -331,7 +402,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
               Positioned(
                 bottom: 110.h,
                 left: 16.w,
-                child: _LegendWidget(onClose: () => setState(() => _showLegend = false)),
+                child: _LegendWidget(
+                    onClose: () => setState(() => _showLegend = false)),
               ),
           ],
         ),
@@ -404,7 +476,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
                 style: TextStyle(fontSize: 14.sp, color: Colors.black87),
                 decoration: InputDecoration(
                   hintText: context.tr('search_hint'),
-                  hintStyle: TextStyle(color: Colors.grey[400], fontSize: 13.sp),
+                  hintStyle:
+                      TextStyle(color: Colors.grey[400], fontSize: 13.sp),
                   border: InputBorder.none,
                   isDense: true,
                   contentPadding: EdgeInsets.symmetric(vertical: 14.h),
@@ -420,7 +493,9 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
             IconButton(
               icon: Icon(
                 _isFilterExpanded ? Icons.filter_list_off : Icons.filter_list,
-                color: _isFilterExpanded ? Theme.of(context).primaryColor : Colors.grey[600],
+                color: _isFilterExpanded
+                    ? Theme.of(context).primaryColor
+                    : Colors.grey[600],
                 size: 22.sp,
               ),
               onPressed: () {
@@ -478,7 +553,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
         backgroundColor: backgroundColor ?? Theme.of(context).primaryColor,
         elevation: 6,
         highlightElevation: 10,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.r)),
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.r)),
         child: isLoading
             ? Padding(
                 padding: EdgeInsets.all(14.w),
@@ -665,7 +741,8 @@ class _FilterChipsList extends StatelessWidget {
                     label,
                     style: TextStyle(
                       color: isSelected ? Colors.white : Colors.black87,
-                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                      fontWeight:
+                          isSelected ? FontWeight.w600 : FontWeight.w500,
                       fontSize: 12.sp,
                     ),
                   ),
@@ -692,7 +769,8 @@ class _LegendWidget extends StatelessWidget {
         color: Colors.white.withOpacity(0.96),
         borderRadius: BorderRadius.circular(16.r),
         boxShadow: const [
-          BoxShadow(color: Color(0x1F000000), blurRadius: 16, offset: Offset(0, 4)),
+          BoxShadow(
+              color: Color(0x1F000000), blurRadius: 16, offset: Offset(0, 4)),
         ],
         border: Border.all(color: Colors.white.withOpacity(0.4)),
       ),
@@ -707,7 +785,8 @@ class _LegendWidget extends StatelessWidget {
               children: [
                 Text(
                   context.tr('legend_title'),
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 13),
                 ),
                 InkWell(
                   onTap: onClose,
@@ -729,12 +808,14 @@ class _LegendWidget extends StatelessWidget {
                             padding: EdgeInsets.only(bottom: 10.h),
                             child: Row(
                               children: [
-                                Icon(e.value['icon'], color: e.value['color'], size: 18),
+                                Icon(e.value['icon'],
+                                    color: e.value['color'], size: 18),
                                 SizedBox(width: 8.w),
                                 Expanded(
                                   child: Text(
                                     e.key,
-                                    style: TextStyle(fontSize: 12, color: Colors.grey[800]),
+                                    style: TextStyle(
+                                        fontSize: 12, color: Colors.grey[800]),
                                     overflow: TextOverflow.ellipsis,
                                   ),
                                 ),
@@ -788,12 +869,15 @@ class _ProviderDetailsSheet extends StatelessWidget {
               Container(
                 padding: EdgeInsets.all(12.w),
                 decoration: BoxDecoration(
-                  color: (_typeIconMap[provider.type]?['color'] ?? Theme.of(context).primaryColor).withOpacity(0.1),
+                  color: (_typeIconMap[provider.type]?['color'] ??
+                          Theme.of(context).primaryColor)
+                      .withOpacity(0.1),
                   borderRadius: BorderRadius.circular(16.r),
                 ),
                 child: Icon(
                   _typeIconMap[provider.type]?['icon'] ?? Icons.local_hospital,
-                  color: _typeIconMap[provider.type]?['color'] ?? Theme.of(context).primaryColor,
+                  color: _typeIconMap[provider.type]?['color'] ??
+                      Theme.of(context).primaryColor,
                   size: 32.sp,
                 ),
               ),
@@ -813,14 +897,18 @@ class _ProviderDetailsSheet extends StatelessWidget {
                     ),
                     SizedBox(height: 6.h),
                     Container(
-                      padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 4.h),
+                      padding:
+                          EdgeInsets.symmetric(horizontal: 10.w, vertical: 4.h),
                       decoration: BoxDecoration(
                         color: Colors.grey[100],
                         borderRadius: BorderRadius.circular(6.r),
                       ),
                       child: Text(
                         provider.type,
-                        style: TextStyle(color: Colors.grey[700], fontSize: 12.sp, fontWeight: FontWeight.w500),
+                        style: TextStyle(
+                            color: Colors.grey[700],
+                            fontSize: 12.sp,
+                            fontWeight: FontWeight.w500),
                       ),
                     ),
                   ],
@@ -835,7 +923,11 @@ class _ProviderDetailsSheet extends StatelessWidget {
 
           // Details
           _DetailRow(icon: Icons.place_outlined, text: provider.address),
-          if (provider.phone.isNotEmpty) _DetailRow(icon: Icons.phone_outlined, text: provider.phone, isPhone: true),
+          if (provider.phone.isNotEmpty)
+            _DetailRow(
+                icon: Icons.phone_outlined,
+                text: provider.phone,
+                isPhone: true),
           if (provider.discountPct.isNotEmpty)
             _DetailRow(
               icon: Icons.local_offer_outlined,
@@ -914,7 +1006,8 @@ class _DetailRow extends StatelessWidget {
             Expanded(
               child: Text(
                 text,
-                style: TextStyle(fontSize: 14.sp, color: color, fontWeight: FontWeight.bold),
+                style: TextStyle(
+                    fontSize: 14.sp, color: color, fontWeight: FontWeight.bold),
               ),
             ),
           ],
@@ -974,7 +1067,9 @@ class _MainActionButton extends StatelessWidget {
         child: Container(
           padding: EdgeInsets.symmetric(vertical: 14.h),
           decoration: BoxDecoration(
-            border: isOutlined ? Border.all(color: color.withOpacity(0.4), width: 1.5) : null,
+            border: isOutlined
+                ? Border.all(color: color.withOpacity(0.4), width: 1.5)
+                : null,
             borderRadius: BorderRadius.circular(14.r),
           ),
           child: Row(
@@ -1007,15 +1102,19 @@ class _MapIconCache {
   static final Map<String, BitmapDescriptor> _staticSelectedIconCache = {};
   static bool _isGenerated = false;
 
-  Future<void> generateTypeIcons(Map<String, Map<String, dynamic>> typeIconMap) async {
+  Future<void> generateTypeIcons(
+      Map<String, Map<String, dynamic>> typeIconMap) async {
     if (_isGenerated) return;
 
     try {
       final futures = <Future>[];
 
-      futures.add(_BitmapGenerator.create(Icons.location_on, Colors.blue, _iconSizeNormal)
+      futures.add(_BitmapGenerator.create(
+              Icons.location_on, Colors.blue, _iconSizeNormal)
           .then((icon) => _staticIconCache['default'] = icon));
-      futures.add(_BitmapGenerator.create(Icons.location_on, Colors.blue, _iconSizeSelected, isSelected: true)
+      futures.add(_BitmapGenerator.create(
+              Icons.location_on, Colors.blue, _iconSizeSelected,
+              isSelected: true)
           .then((icon) => _staticSelectedIconCache['default'] = icon));
 
       for (var entry in typeIconMap.entries) {
@@ -1025,7 +1124,8 @@ class _MapIconCache {
 
         futures.add(_BitmapGenerator.create(icon, color, _iconSizeNormal)
             .then((desc) => _staticIconCache[type] = desc));
-        futures.add(_BitmapGenerator.create(icon, color, _iconSizeSelected, isSelected: true)
+        futures.add(_BitmapGenerator.create(icon, color, _iconSizeSelected,
+                isSelected: true)
             .then((desc) => _staticSelectedIconCache[type] = desc));
       }
 
@@ -1037,19 +1137,25 @@ class _MapIconCache {
   }
 
   BitmapDescriptor? getIcon(String type) => _staticIconCache[type];
-  BitmapDescriptor? getSelectedIcon(String type) => _staticSelectedIconCache[type];
+  BitmapDescriptor? getSelectedIcon(String type) =>
+      _staticSelectedIconCache[type];
   BitmapDescriptor? getDefaultIcon() => _staticIconCache['default'];
-  BitmapDescriptor? getDefaultSelectedIcon() => _staticSelectedIconCache['default'];
+  BitmapDescriptor? getDefaultSelectedIcon() =>
+      _staticSelectedIconCache['default'];
 }
 
 class _BitmapGenerator {
-  static Future<BitmapDescriptor> create(IconData icon, Color color, double size, {bool isSelected = false}) async {
+  static Future<BitmapDescriptor> create(
+      IconData icon, Color color, double size,
+      {bool isSelected = false}) async {
     final ui.PictureRecorder recorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(recorder);
     final double center = size / 2;
 
     // Shadow
-    final path = Path()..addOval(Rect.fromCircle(center: Offset(center, center), radius: center - 4));
+    final path = Path()
+      ..addOval(
+          Rect.fromCircle(center: Offset(center, center), radius: center - 4));
     canvas.drawShadow(path, Colors.black.withOpacity(0.25), 4.0, true);
 
     // Background
@@ -1077,7 +1183,8 @@ class _BitmapGenerator {
     tp.layout();
     tp.paint(canvas, Offset((size - tp.width) / 2, (size - tp.height) / 2));
 
-    final img = await recorder.endRecording().toImage(size.toInt(), size.toInt());
+    final img =
+        await recorder.endRecording().toImage(size.toInt(), size.toInt());
     final data = await img.toByteData(format: ui.ImageByteFormat.png);
     return BitmapDescriptor.bytes(data!.buffer.asUint8List());
   }
