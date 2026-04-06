@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:math';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -19,8 +19,7 @@ import '../services/location_service.dart';
 // CONSTANTS & CONFIGURATION
 // ============================================================================
 
-const double _defaultMapZoom = 12.0;
-const double _markerZoomLevel = 14.5;
+const double _defaultMapZoom = 15.0;
 const double _defaultLatitude = 30.0444;
 const double _defaultLongitude = 31.2357;
 
@@ -28,9 +27,9 @@ const Duration _animationDuration = Duration(milliseconds: 300);
 const Duration _debounceDuration = Duration(milliseconds: 400);
 
 // Use slightly larger icons for better visibility on high-DPI screens
-const double _iconSizeNormal = 100.0;
-const double _iconSizeSelected = 130.0;
-const double _iconBorderWidth = 5.0;
+const double _iconSizeNormal = 30.0;
+const double _iconSizeSelected = 35.0;
+const double _iconBorderWidth = 1.0;
 
 Map<String, Map<String, dynamic>> _typeIconMap = {
   'صيدلية': {'icon': Icons.local_pharmacy, 'color': Colors.green},
@@ -58,11 +57,13 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
   // Logic & Services
   late final MapProvidersCubit _cubit;
   late final _MapIconCache _iconCache;
+  late final ValueNotifier<Set<Marker>> _markersNotifier;
 
   // Controllers
-  final Completer<GoogleMapController> _controllerCompleter = Completer<GoogleMapController>();
+  late GoogleMapController _mapController;
   final TextEditingController _searchController = TextEditingController();
   Timer? _searchDebounceTimer;
+  Timer? _cameraIdleTimer;
 
   // Local State
   LatLng? _currentLocation;
@@ -70,21 +71,20 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
   bool _isFilterExpanded = false;
   bool _showLegend = false;
   bool _isLocationLoading = false;
-  bool _isMapReady = false; // Platform stabilization guard
-  bool _showMap = false;
-  bool _isDataLoaded = false;
   bool _locationPermissionGranted = false;
 
-  // Memoization Cache for diffing
-  Set<Marker> _currentMarkers = const {};
-  List<ProviderEntity>? _lastFilteredProviders;
-  ProviderEntity? _lastSelectedProvider;
+  // Viewport & Data
+  LatLngBounds? _visibleBounds;
+  List<ProviderEntity>? _filteredProviders;
+  List<ProviderEntity>? _visibleProviders;
+  ProviderEntity? _selectedProvider;
   final Map<String, Marker> _markerCache = {};
 
-  // Helpers
+  // Marker Rendering
   Timer? _batchTimer;
   int _batchIndex = 0;
-  static const int _batchSize = 40;
+  static const int _batchSize = 30;
+  static const Duration _cameraIdleDebounce = Duration(milliseconds: 300);
 
   @override
   void initState() {
@@ -92,45 +92,25 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _cubit = sl<MapProvidersCubit>();
     _iconCache = _MapIconCache();
+    _markersNotifier = ValueNotifier<Set<Marker>>(const {});
 
     _initializeApp();
   }
 
   Future<void> _initializeApp() async {
     _locationPermissionGranted = await LocationService.requestLocationPermission();
-
     _startParallelInitialization();
-
-    await Future.delayed(Duration(milliseconds: Platform.isIOS ? 500 : 100));
-    if (mounted) {
-      setState(() => _isMapReady = true);
-      _prepareMapWhenReady();
-    }
-  }
-
-  void _prepareMapWhenReady() {
-    if (!_isMapReady || !_isDataLoaded || !_areIconsReady || _showMap) return;
-
-    Future.delayed(const Duration(milliseconds: 100), () {
-      if (!mounted) return;
-      setState(() => _showMap = true);
-    });
   }
 
   void _startParallelInitialization() {
-    // Generate icons asynchronously
     _iconCache.generateTypeIcons(_typeIconMap).then((_) {
-      if (mounted) {
-        setState(() => _areIconsReady = true);
-        _prepareMapWhenReady();
-      }
+      if (mounted) setState(() => _areIconsReady = true);
     });
 
     _cubit.loadMapProviders();
 
-    // Get location only if permission granted
     if (_locationPermissionGranted) {
-      _getCurrentLocation(animate: true);
+      _getCurrentLocation(animate: false);
     }
   }
 
@@ -139,6 +119,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _batchTimer?.cancel();
     _searchDebounceTimer?.cancel();
+    _cameraIdleTimer?.cancel();
+    _markersNotifier.dispose();
     _cubit.close();
     _searchController.dispose();
     super.dispose();
@@ -157,19 +139,10 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
           _isLocationLoading = false;
           if (loc != null) _currentLocation = loc;
         });
-
-        if (loc != null && animate && _controllerCompleter.isCompleted) {
-          final controller = await _controllerCompleter.future;
-          _animateCamera(controller, loc, zoom: _markerZoomLevel);
-        }
       }
     } catch (_) {
       if (mounted) setState(() => _isLocationLoading = false);
     }
-  }
-
-  void _animateCamera(GoogleMapController controller, LatLng target, {double zoom = _defaultMapZoom}) {
-    controller.animateCamera(CameraUpdate.newLatLngZoom(target, zoom));
   }
 
   // --- Search Logic ---
@@ -185,17 +158,59 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     });
   }
 
-  // --- Marker Building (Optimized) ---
+  // --- Viewport & Camera Logic ---
+
+  void _onCameraMove(CameraPosition position) {
+    _visibleBounds = _calculateVisibleBounds(position);
+  }
+
+  void _onCameraIdle() {
+    _cameraIdleTimer?.cancel();
+    _cameraIdleTimer = Timer(_cameraIdleDebounce, () {
+      if (!mounted) return;
+      _updateVisibleMarkers();
+    });
+  }
+
+  LatLngBounds _calculateVisibleBounds(CameraPosition position) {
+    const zoomPadding = 0.15;
+    final distance = 40000 / pow(2, position.zoom);
+    final latOffset = distance / 111.0;
+    final lngOffset = distance / (111.0 * cos(position.target.latitude * pi / 180));
+
+    return LatLngBounds(
+      southwest: LatLng(
+        position.target.latitude - latOffset * (1 + zoomPadding),
+        position.target.longitude - lngOffset * (1 + zoomPadding),
+      ),
+      northeast: LatLng(
+        position.target.latitude + latOffset * (1 + zoomPadding),
+        position.target.longitude + lngOffset * (1 + zoomPadding),
+      ),
+    );
+  }
+
+  bool _isProviderVisible(ProviderEntity provider) {
+    if (_visibleBounds == null) return true;
+    final markerLatLng = LatLng(provider.latitude ?? 0, provider.longitude ?? 0);
+    return _visibleBounds!.contains(markerLatLng);
+  }
+
+  void _updateVisibleMarkers() {
+    if (_filteredProviders == null || !_areIconsReady) return;
+    _visibleProviders = _filteredProviders!.where(_isProviderVisible).toList();
+    _scheduleMarkerBatch(_visibleProviders ?? [], _selectedProvider);
+  }
+
+  // --- Marker Rendering ---
 
   void _scheduleMarkerBatch(List<ProviderEntity> providers, ProviderEntity? selected) {
     _batchTimer?.cancel();
 
-    if (providers == _lastFilteredProviders && selected == _lastSelectedProvider && _currentMarkers.isNotEmpty) {
+    if (providers.isEmpty) {
+      _markersNotifier.value = const {};
       return;
     }
-
-    _lastFilteredProviders = providers;
-    _lastSelectedProvider = selected;
 
     final Set<Marker> newMarkers = {};
     _batchIndex = 0;
@@ -211,6 +226,7 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
 
       if (start >= providers.length) {
         timer.cancel();
+        _markersNotifier.value = newMarkers;
         return;
       }
 
@@ -221,39 +237,27 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
       }
 
       _batchIndex = end;
-
-      setState(() {
-        _currentMarkers = newMarkers;
-      });
-
-      if (_batchIndex >= providers.length) {
-        timer.cancel();
-      }
+      _markersNotifier.value = Set.from(newMarkers);
     });
   }
 
   Marker _buildMarker(ProviderEntity provider, bool isSelected) {
-    final cacheKey = '${provider.id}_${isSelected ? 'selected' : 'default'}';
-    if (_markerCache.containsKey(cacheKey)) {
-      return _markerCache[cacheKey]!;
-    }
+    final cacheKey = '${provider.id}_${isSelected ? 'sel' : 'def'}';
+    return _markerCache.putIfAbsent(cacheKey, () {
+      final type = provider.type;
+      final icon = isSelected
+          ? (_iconCache.getSelectedIcon(type) ?? _iconCache.getDefaultSelectedIcon())
+          : (_iconCache.getIcon(type) ?? _iconCache.getDefaultIcon());
 
-    final type = provider.type;
-    final icon = isSelected
-        ? (_iconCache.getSelectedIcon(type) ?? _iconCache.getDefaultSelectedIcon())
-        : (_iconCache.getIcon(type) ?? _iconCache.getDefaultIcon());
-
-    final marker = Marker(
-      markerId: MarkerId(provider.id.toString()),
-      position: LatLng(provider.latitude ?? 0, provider.longitude ?? 0),
-      icon: icon ?? BitmapDescriptor.defaultMarker,
-      zIndexInt: isSelected ? 10 : 1,
-      anchor: const Offset(0.5, 0.5),
-      onTap: () => _onMarkerTap(provider),
-    );
-
-    _markerCache[cacheKey] = marker;
-    return marker;
+      return Marker(
+        markerId: MarkerId(provider.id.toString()),
+        position: LatLng(provider.latitude ?? 0, provider.longitude ?? 0),
+        icon: icon ?? BitmapDescriptor.defaultMarker,
+        zIndexInt: isSelected ? 10 : 1,
+        anchor: const Offset(0.5, 0.5),
+        onTap: () => _onMarkerTap(provider),
+      );
+    });
   }
 
   void _onMarkerTap(ProviderEntity provider) {
@@ -336,7 +340,7 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
   }
 
   Widget _buildMapLayer() {
-    return BlocConsumer<MapProvidersCubit, MapProvidersState>(
+    return BlocListener<MapProvidersCubit, MapProvidersState>(
       listener: (context, state) {
         if (state is MapProvidersError) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -344,58 +348,33 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
           );
         }
         if (state is MapProvidersLoaded) {
-          _isDataLoaded = true;
-          if (_areIconsReady) {
-            _scheduleMarkerBatch(state.filteredProviders, state.selectedProvider);
+          _filteredProviders = state.filteredProviders;
+          _selectedProvider = state.selectedProvider;
+          if (_visibleBounds != null && _areIconsReady) {
+            _updateVisibleMarkers();
           }
-          _prepareMapWhenReady();
         }
       },
-      buildWhen: (previous, current) => current.runtimeType != previous.runtimeType,
-      builder: (context, state) {
-        if (!_showMap) {
-          return _buildMapPlaceholder(state);
-        }
-
-        return _ProviderMapView(
-          markers: _currentMarkers,
-          myLocationEnabled: _locationPermissionGranted,
-          currentLocation: _currentLocation,
-          onMapCreated: _onMapCreated,
-          onMapTap: () {
-            FocusScope.of(context).unfocus();
-            _cubit.selectProvider(null);
-          },
-        );
-      },
+      child: _ProviderMapView(
+        markersNotifier: _markersNotifier,
+        myLocationEnabled: _locationPermissionGranted,
+        currentLocation: _currentLocation,
+        onMapCreated: _onMapCreated,
+        onCameraMove: _onCameraMove,
+        onCameraIdle: _onCameraIdle,
+        onMapTap: () {
+          FocusScope.of(context).unfocus();
+          _cubit.selectProvider(null);
+        },
+      ),
     );
   }
 
   void _onMapCreated(GoogleMapController controller) {
-    if (!_controllerCompleter.isCompleted) {
-      _controllerCompleter.complete(controller);
-    }
-  }
-
-  Widget _buildMapPlaceholder(MapProvidersState state) {
-    final bool isLoading = state is MapProvidersLoading || !_isDataLoaded || !_areIconsReady;
-
-    return Container(
-      color: Colors.grey.shade100,
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(height: 16),
-            Text(
-              isLoading ? 'Loading map data…' : 'Preparing map…',
-              style: TextStyle(color: Colors.grey[700], fontSize: 14.sp),
-            ),
-          ],
-        ),
-      ),
-    );
+    _mapController = controller;
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (mounted) _updateVisibleMarkers();
+    });
   }
 
   Widget _buildFloatingSearchBar() {
@@ -532,17 +511,21 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
 // ============================================================================
 
 class _ProviderMapView extends StatefulWidget {
-  final Set<Marker> markers;
+  final ValueNotifier<Set<Marker>> markersNotifier;
   final bool myLocationEnabled;
   final LatLng? currentLocation;
   final void Function(GoogleMapController) onMapCreated;
+  final void Function(CameraPosition) onCameraMove;
+  final VoidCallback onCameraIdle;
   final VoidCallback onMapTap;
 
   const _ProviderMapView({
-    required this.markers,
+    required this.markersNotifier,
     required this.myLocationEnabled,
     required this.currentLocation,
     required this.onMapCreated,
+    required this.onCameraMove,
+    required this.onCameraIdle,
     required this.onMapTap,
   });
 
@@ -558,28 +541,31 @@ class _ProviderMapViewState extends State<_ProviderMapView> {
 
   @override
   Widget build(BuildContext context) {
-    return GoogleMap(
-      initialCameraPosition: _initialCameraPosition,
-      markers: widget.markers,
-      onMapCreated: _handleMapCreated,
-      myLocationEnabled: widget.myLocationEnabled,
-      myLocationButtonEnabled: false,
-      trafficEnabled: false,
-      buildingsEnabled: false,
-      mapToolbarEnabled: false,
-      compassEnabled: false,
-      rotateGesturesEnabled: true,
-      tiltGesturesEnabled: false,
-      onTap: (_) => widget.onMapTap(),
+    return ValueListenableBuilder<Set<Marker>>(
+      valueListenable: widget.markersNotifier,
+      builder: (context, markers, _) {
+        return GoogleMap(
+          initialCameraPosition: _initialCameraPosition,
+          markers: markers,
+          onMapCreated: _handleMapCreated,
+          onCameraMove: widget.onCameraMove,
+          onCameraIdle: widget.onCameraIdle,
+          myLocationEnabled: widget.myLocationEnabled,
+          myLocationButtonEnabled: false,
+          trafficEnabled: false,
+          buildingsEnabled: false,
+          mapToolbarEnabled: false,
+          compassEnabled: false,
+          rotateGesturesEnabled: true,
+          tiltGesturesEnabled: false,
+          onTap: (_) => widget.onMapTap(),
+        );
+      },
     );
   }
 
   void _handleMapCreated(GoogleMapController controller) {
     widget.onMapCreated(controller);
-
-    if (widget.currentLocation != null) {
-      controller.moveCamera(CameraUpdate.newLatLngZoom(widget.currentLocation!, _markerZoomLevel));
-    }
   }
 }
 
