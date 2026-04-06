@@ -68,11 +68,12 @@ class ProvidersRemoteDataSourceImpl implements ProvidersRemoteDataSource {
       queryParams[ApiConstants.searchName] = params.searchName;
     }
     if (params.type != null && params.type!.isNotEmpty) {
-      if (params.type == 'معمل تحاليل') {
-        queryParams[ApiConstants.type] = 'معامل التحاليل';
-      } else {
-        queryParams[ApiConstants.type] = params.type;
-      }
+      queryParams[ApiConstants.type] = params.type;
+      // if (params.type == 'معمل تحاليل') {
+      //   queryParams[ApiConstants.type] = 'معامل التحاليل';
+      // } else {
+      //   queryParams[ApiConstants.type] = params.type;
+      // }
     }
     if (params.search != null && params.search!.isNotEmpty) {
       queryParams[ApiConstants.search] = params.search;

@@ -25,16 +25,16 @@ class _HomePageState extends State<HomePage> {
 
   static const List<Map<String, String>> _categories = [
     {'title': 'hospital', 'image': 'hospital.jpg', 'item': 'مستشفى'},
-    {'title': 'radiology', 'image': 'scan.jpg', 'item': 'مراكز الأشعة'},
+    {'title': 'radiology', 'image': 'scan.jpg', 'item': 'مركز أشعة'},
     {
       'title': 'laboratory',
       'image': 'medicaltests.jpg',
-      'item': 'معامل التحاليل'
+      'item': 'معمل تحاليل'
     },
     {
       'title': 'specialized_centers',
       'image': 'clinic.jpg',
-      'item': 'مراكز متخصصة'
+      'item': 'مركز متخصص'
     },
     {'title': 'clinic', 'image': 'clinic.jpg', 'item': 'عيادة'},
     {'title': 'pharmacy', 'image': 'pharmacy.jpg', 'item': 'صيدلية'},

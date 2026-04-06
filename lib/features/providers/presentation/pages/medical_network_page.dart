@@ -11,9 +11,9 @@ class MedicalNetworkPage extends StatelessWidget {
 
   static const List<Map<String, String>> _categories = [
     {'title': 'المستشفيات', 'image': 'hospital.jpg', 'item': 'مستشفى'},
-    {'title': 'مراكز الأشعة', 'image': 'scan.jpg', 'item': 'مراكز الأشعة'},
-    {'title': 'معامل التحاليل', 'image': 'medicaltests.jpg', 'item': 'معامل التحاليل'},
-    {'title': 'مراكز متخصصة', 'image': 'clinic.jpg', 'item': 'مراكز متخصصة'},
+    {'title': 'مراكز الأشعة', 'image': 'scan.jpg', 'item': 'مركز أشعة'},
+    {'title': 'معامل التحاليل', 'image': 'medicaltests.jpg', 'item': 'معمل تحاليل'},
+    {'title': 'مراكز متخصصة', 'image': 'clinic.jpg', 'item': 'مركز متخصص'},
     {'title': 'العيادات', 'image': 'clinic.jpg', 'item': 'عيادة'},
     {'title': 'الصيدليات', 'image': 'pharmacy.jpg', 'item': 'صيدلية'},
     {'title': 'العلاج الطبيعي', 'image': 'physical.jpg', 'item': 'علاج طبيعي'},
