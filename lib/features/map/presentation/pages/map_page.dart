@@ -2,12 +2,10 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -15,6 +13,7 @@ import '../../../../core/localization/app_localizations.dart';
 import '../../../../di/injection_container.dart';
 import '../../../providers/domain/entities/provider_entity.dart';
 import '../../../providers/presentation/cubit/map_providers/map_providers_cubit.dart';
+import '../services/location_service.dart';
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
@@ -33,7 +32,7 @@ const double _iconSizeNormal = 100.0;
 const double _iconSizeSelected = 130.0;
 const double _iconBorderWidth = 5.0;
 
-const Map<String, Map<String, dynamic>> _typeIconMap = {
+Map<String, Map<String, dynamic>> _typeIconMap = {
   'صيدلية': {'icon': Icons.local_pharmacy, 'color': Colors.green},
   'مستشفى': {'icon': Icons.local_hospital, 'color': Colors.red},
   'معامل التحاليل': {'icon': Icons.science, 'color': Colors.blue},
@@ -61,28 +60,31 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
   late final _MapIconCache _iconCache;
 
   // Controllers
-  GoogleMapController? _mapController;
+  final Completer<GoogleMapController> _controllerCompleter = Completer<GoogleMapController>();
   final TextEditingController _searchController = TextEditingController();
   Timer? _searchDebounceTimer;
 
   // Local State
-  LatLng? _currentLocation; // User's location
-  bool _areIconsReady =
-      false; // Prevents markers from showing before icons are ready
+  LatLng? _currentLocation;
+  bool _areIconsReady = false;
   bool _isFilterExpanded = false;
   bool _showLegend = false;
   bool _isLocationLoading = false;
-  bool _isMapReadyForiOS = false; // Guard for iOS platform view race condition
+  bool _isMapReady = false; // Platform stabilization guard
+  bool _showMap = false;
+  bool _isDataLoaded = false;
+  bool _locationPermissionGranted = false;
 
   // Memoization Cache for diffing
-  Set<Marker> _currentMarkers = {};
+  Set<Marker> _currentMarkers = const {};
   List<ProviderEntity>? _lastFilteredProviders;
   ProviderEntity? _lastSelectedProvider;
+  final Map<String, Marker> _markerCache = {};
 
   // Helpers
   Timer? _batchTimer;
-  int _bachedIndex = 0;
-  static const int _batchSize = 40; // Process 40 markers per frame (~1-2ms)
+  int _batchIndex = 0;
+  static const int _batchSize = 40;
 
   @override
   void initState() {
@@ -91,34 +93,45 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     _cubit = sl<MapProvidersCubit>();
     _iconCache = _MapIconCache();
 
-    // 1. NON-BLOCKING Initialization
+    _initializeApp();
+  }
+
+  Future<void> _initializeApp() async {
+    _locationPermissionGranted = await LocationService.requestLocationPermission();
+
     _startParallelInitialization();
 
-    // iOS Platform View Fix: Delay rendering slightly to ensure view hierarchy is ready
-    if (Platform.isIOS) {
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (mounted) setState(() => _isMapReadyForiOS = true);
-      });
-    } else {
-      _isMapReadyForiOS = true;
+    await Future.delayed(Duration(milliseconds: Platform.isIOS ? 500 : 100));
+    if (mounted) {
+      setState(() => _isMapReady = true);
+      _prepareMapWhenReady();
     }
   }
 
+  void _prepareMapWhenReady() {
+    if (!_isMapReady || !_isDataLoaded || !_areIconsReady || _showMap) return;
+
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (!mounted) return;
+      setState(() => _showMap = true);
+    });
+  }
+
   void _startParallelInitialization() {
-    // Generate icons if not ready (uses static cache internally so it's fast if already done)
+    // Generate icons asynchronously
     _iconCache.generateTypeIcons(_typeIconMap).then((_) {
       if (mounted) {
         setState(() => _areIconsReady = true);
-        // If data was already loaded, trigger batching now
-        if (_cubit.state is MapProvidersLoaded) {
-          final state = _cubit.state as MapProvidersLoaded;
-          _scheduleMarkerBatch(state.filteredProviders, state.selectedProvider);
-        }
+        _prepareMapWhenReady();
       }
     });
 
     _cubit.loadMapProviders();
-    _getCurrentLocation(animate: true);
+
+    // Get location only if permission granted
+    if (_locationPermissionGranted) {
+      _getCurrentLocation(animate: true);
+    }
   }
 
   @override
@@ -127,28 +140,27 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     _batchTimer?.cancel();
     _searchDebounceTimer?.cancel();
     _cubit.close();
-    _mapController?.dispose();
     _searchController.dispose();
-    // _iconCache.dispose(); // Keep cache alive for re-entry
     super.dispose();
   }
 
   // --- Location Logic ---
 
   Future<void> _getCurrentLocation({bool animate = false}) async {
-    if (!mounted) return;
+    if (!mounted || !_locationPermissionGranted) return;
     setState(() => _isLocationLoading = true);
 
     try {
-      final loc = await _LocationService.getCurrentLocation();
+      final loc = await LocationService.getCurrentLocation();
       if (mounted) {
         setState(() {
           _isLocationLoading = false;
           if (loc != null) _currentLocation = loc;
         });
 
-        if (loc != null && animate && _mapController != null) {
-          _animateCamera(loc, zoom: _markerZoomLevel);
+        if (loc != null && animate && _controllerCompleter.isCompleted) {
+          final controller = await _controllerCompleter.future;
+          _animateCamera(controller, loc, zoom: _markerZoomLevel);
         }
       }
     } catch (_) {
@@ -156,12 +168,8 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     }
   }
 
-  void _animateCamera(LatLng target, {double zoom = _defaultMapZoom}) {
-    try {
-      _mapController?.animateCamera(CameraUpdate.newLatLngZoom(target, zoom));
-    } catch (e) {
-      debugPrint('Error animating camera: $e');
-    }
+  void _animateCamera(GoogleMapController controller, LatLng target, {double zoom = _defaultMapZoom}) {
+    controller.animateCamera(CameraUpdate.newLatLngZoom(target, zoom));
   }
 
   // --- Search Logic ---
@@ -179,29 +187,18 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
 
   // --- Marker Building (Optimized) ---
 
-  // --- Batched Marker Building ---
-
   void _scheduleMarkerBatch(List<ProviderEntity> providers, ProviderEntity? selected) {
     _batchTimer?.cancel();
-    
-    // Check if we really need to update (diffing)
+
     if (providers == _lastFilteredProviders && selected == _lastSelectedProvider && _currentMarkers.isNotEmpty) {
       return;
     }
 
     _lastFilteredProviders = providers;
     _lastSelectedProvider = selected;
-    
-    // Reset
-    // Note: We do NOT clear _currentMarkers immediately to prevent flashing.
-    // We build a NEW set incrementally and replace at end? 
-    // OR add incrementally?
-    // "Markers appear progressively" -> Add incrementally.
-    
-    // If list changed significantly (e.g. filter), we might want to clear old ones.
-    // For now, let's start fresh for the new batch to ensure correctness.
+
     final Set<Marker> newMarkers = {};
-    _bachedIndex = 0;
+    _batchIndex = 0;
 
     _batchTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
       if (!mounted) {
@@ -209,59 +206,59 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
         return;
       }
 
-      final int start = _bachedIndex;
-      final int end = (start + _batchSize < providers.length) 
-          ? start + _batchSize 
-          : providers.length;
+      final int start = _batchIndex;
+      final int end = (start + _batchSize < providers.length) ? start + _batchSize : providers.length;
 
       if (start >= providers.length) {
         timer.cancel();
         return;
       }
 
-      // Generate batch
       for (int i = start; i < end; i++) {
         final provider = providers[i];
         final isSelected = selected?.id == provider.id;
-        final type = provider.type;
-        
-        // Use cached icons (instant)
-        final icon = isSelected
-            ? (_iconCache.getSelectedIcon(type) ?? _iconCache.getDefaultSelectedIcon())
-            : (_iconCache.getIcon(type) ?? _iconCache.getDefaultIcon());
-
-        newMarkers.add(
-          Marker(
-            markerId: MarkerId(provider.id.toString()),
-            position: LatLng(provider.latitude ?? 0, provider.longitude ?? 0),
-            icon: icon ?? BitmapDescriptor.defaultMarker,
-            zIndex: isSelected ? 10.0 : 1.0,
-            anchor: const Offset(0.5, 0.5),
-            onTap: () {
-              _cubit.selectProvider(provider);
-              _showProviderDetails(provider);
-            },
-          ),
-        );
+        newMarkers.add(_buildMarker(provider, isSelected));
       }
 
-      _bachedIndex = end;
+      _batchIndex = end;
 
-      // Update UI incrementally
       setState(() {
-        // We replace the set entirely to ensure GoogleMaps picks up changes
-        // But since we are building `newMarkers` from scratch, we might want to 
-        // accumulate. 
-        // Strategy: 
-        // Frame 1: newMarkers has 50. _currentMarkers = 50.
-        // Frame 2: newMarkers has 100. _currentMarkers = 100.
-        _currentMarkers = Set.of(newMarkers); 
+        _currentMarkers = newMarkers;
       });
 
-      if (_bachedIndex >= providers.length) {
+      if (_batchIndex >= providers.length) {
         timer.cancel();
       }
     });
+  }
+
+  Marker _buildMarker(ProviderEntity provider, bool isSelected) {
+    final cacheKey = '${provider.id}_${isSelected ? 'selected' : 'default'}';
+    if (_markerCache.containsKey(cacheKey)) {
+      return _markerCache[cacheKey]!;
+    }
+
+    final type = provider.type;
+    final icon = isSelected
+        ? (_iconCache.getSelectedIcon(type) ?? _iconCache.getDefaultSelectedIcon())
+        : (_iconCache.getIcon(type) ?? _iconCache.getDefaultIcon());
+
+    final marker = Marker(
+      markerId: MarkerId(provider.id.toString()),
+      position: LatLng(provider.latitude ?? 0, provider.longitude ?? 0),
+      icon: icon ?? BitmapDescriptor.defaultMarker,
+      zIndexInt: isSelected ? 10 : 1,
+      anchor: const Offset(0.5, 0.5),
+      onTap: () => _onMarkerTap(provider),
+    );
+
+    _markerCache[cacheKey] = marker;
+    return marker;
+  }
+
+  void _onMarkerTap(ProviderEntity provider) {
+    _cubit.selectProvider(provider);
+    _showProviderDetails(provider);
   }
 
   @override
@@ -274,10 +271,10 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
         body: Stack(
           fit: StackFit.expand,
           children: [
-            // 1. The Map (Background Layer)
+            // Map Layer
             _buildMapLayer(),
 
-            // 2. Search & Filters (Top Layer)
+            // Search & Filters
             Align(
               alignment: Alignment.topCenter,
               child: SafeArea(
@@ -287,7 +284,6 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       _buildFloatingSearchBar(),
-                      // Loading Indicator
                       BlocBuilder<MapProvidersCubit, MapProvidersState>(
                         builder: (context, state) {
                           if (state is MapProvidersLoading) {
@@ -296,8 +292,7 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
                               child: LinearProgressIndicator(
                                 minHeight: 2.h,
                                 backgroundColor: Colors.transparent,
-                                valueColor: AlwaysStoppedAnimation(
-                                    Theme.of(context).primaryColor),
+                                valueColor: AlwaysStoppedAnimation(Theme.of(context).primaryColor),
                               ),
                             );
                           }
@@ -320,20 +315,19 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
               ),
             ),
 
-            // 3. Floating Controls
+            // Floating Controls
             Positioned(
               bottom: 100.h,
               right: 16.w,
               child: _buildFloatingControls(),
             ),
 
-            // 4. Legend
+            // Legend
             if (_showLegend)
               Positioned(
                 bottom: 110.h,
                 left: 16.w,
-                child: _LegendWidget(
-                    onClose: () => setState(() => _showLegend = false)),
+                child: _LegendWidget(onClose: () => setState(() => _showLegend = false)),
               ),
           ],
         ),
@@ -349,48 +343,26 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
             SnackBar(content: Text(state.message), backgroundColor: Colors.red),
           );
         }
-        // Trigger batching when data changes
-        if (state is MapProvidersLoaded && _areIconsReady) {
-          _scheduleMarkerBatch(state.filteredProviders, state.selectedProvider);
+        if (state is MapProvidersLoaded) {
+          _isDataLoaded = true;
+          if (_areIconsReady) {
+            _scheduleMarkerBatch(state.filteredProviders, state.selectedProvider);
+          }
+          _prepareMapWhenReady();
         }
       },
-      // Only rebuild if switching between major states (Loading/Loaded/Error)
-      // Marker updates are handled by setState in _scheduleMarkerBatch
-      buildWhen: (previous, current) =>
-          current.runtimeType != previous.runtimeType,
+      buildWhen: (previous, current) => current.runtimeType != previous.runtimeType,
       builder: (context, state) {
-        // Use local state _currentMarkers regardless of Cubit state
-        // This ensures markers persist during loading/rebuilds
-        final markers = _currentMarkers;
-        // If loading, we just use _currentMarkers, effectively persisting them.
-
-        if (!_isMapReadyForiOS) {
-          return const SizedBox(); // Prevent blank/glitchy map on iOS startup
+        if (!_showMap) {
+          return _buildMapPlaceholder(state);
         }
 
-        return GoogleMap(
-          initialCameraPosition: CameraPosition(
-            target: _currentLocation ??
-                const LatLng(_defaultLatitude, _defaultLongitude),
-            zoom: _defaultMapZoom,
-          ),
-          markers: markers,
-          onMapCreated: (c) {
-            _mapController = c;
-            // Delay style setting or other heavy work if needed
-            if (_currentLocation != null) {
-              c.moveCamera(CameraUpdate.newLatLng(_currentLocation!));
-            }
-          },
-          myLocationEnabled: true,
-          myLocationButtonEnabled: false, // Custom button used
-          zoomControlsEnabled: false,
-          mapToolbarEnabled: false,
-          compassEnabled: false,
-          liteModeEnabled: false,
-          rotateGesturesEnabled: true,
-          tiltGesturesEnabled: false,
-          onTap: (_) {
+        return _ProviderMapView(
+          markers: _currentMarkers,
+          myLocationEnabled: _locationPermissionGranted,
+          currentLocation: _currentLocation,
+          onMapCreated: _onMapCreated,
+          onMapTap: () {
             FocusScope.of(context).unfocus();
             _cubit.selectProvider(null);
           },
@@ -399,16 +371,43 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
     );
   }
 
+  void _onMapCreated(GoogleMapController controller) {
+    if (!_controllerCompleter.isCompleted) {
+      _controllerCompleter.complete(controller);
+    }
+  }
+
+  Widget _buildMapPlaceholder(MapProvidersState state) {
+    final bool isLoading = state is MapProvidersLoading || !_isDataLoaded || !_areIconsReady;
+
+    return Container(
+      color: Colors.grey.shade100,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            Text(
+              isLoading ? 'Loading map data…' : 'Preparing map…',
+              style: TextStyle(color: Colors.grey[700], fontSize: 14.sp),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildFloatingSearchBar() {
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(30.r),
-        boxShadow: [
+        boxShadow: const [
           BoxShadow(
-            color: Colors.black.withOpacity(0.12),
+            color: Color(0x1F000000),
             blurRadius: 16,
-            offset: const Offset(0, 4),
+            offset: Offset(0, 4),
           ),
         ],
       ),
@@ -426,28 +425,23 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
                 style: TextStyle(fontSize: 14.sp, color: Colors.black87),
                 decoration: InputDecoration(
                   hintText: context.tr('search_hint'),
-                  hintStyle:
-                      TextStyle(color: Colors.grey[400], fontSize: 13.sp),
+                  hintStyle: TextStyle(color: Colors.grey[400], fontSize: 13.sp),
                   border: InputBorder.none,
                   isDense: true,
                   contentPadding: EdgeInsets.symmetric(vertical: 14.h),
                 ),
               ),
             ),
-            // Divider
             Container(
               height: 24.h,
               width: 1,
               color: Colors.grey[300],
               margin: EdgeInsets.symmetric(horizontal: 4.w),
             ),
-            // Filter Toggle
             IconButton(
               icon: Icon(
                 _isFilterExpanded ? Icons.filter_list_off : Icons.filter_list,
-                color: _isFilterExpanded
-                    ? Theme.of(context).primaryColor
-                    : Colors.grey[600],
+                color: _isFilterExpanded ? Theme.of(context).primaryColor : Colors.grey[600],
                 size: 22.sp,
               ),
               onPressed: () {
@@ -481,10 +475,7 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
         _buildFab(
           heroTag: 'location_fab',
           icon: _isLocationLoading ? Icons.gps_not_fixed : Icons.my_location,
-          onTap: () {
-            HapticFeedback.selectionClick();
-            _getCurrentLocation(animate: true);
-          },
+          onTap: () => _getCurrentLocation(animate: true),
           isLoading: _isLocationLoading,
         ),
       ],
@@ -508,8 +499,7 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
         backgroundColor: backgroundColor ?? Theme.of(context).primaryColor,
         elevation: 6,
         highlightElevation: 10,
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.r)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.r)),
         child: isLoading
             ? Padding(
                 padding: EdgeInsets.all(14.w),
@@ -532,7 +522,6 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
       backgroundColor: Colors.transparent,
       builder: (_) => _ProviderDetailsSheet(provider: provider),
     ).whenComplete(() {
-      // Clear selection when sheet closes
       _cubit.selectProvider(null);
     });
   }
@@ -542,6 +531,58 @@ class _MapDataState extends State<MapData> with WidgetsBindingObserver {
 // SUB-WIDGETS
 // ============================================================================
 
+class _ProviderMapView extends StatefulWidget {
+  final Set<Marker> markers;
+  final bool myLocationEnabled;
+  final LatLng? currentLocation;
+  final void Function(GoogleMapController) onMapCreated;
+  final VoidCallback onMapTap;
+
+  const _ProviderMapView({
+    required this.markers,
+    required this.myLocationEnabled,
+    required this.currentLocation,
+    required this.onMapCreated,
+    required this.onMapTap,
+  });
+
+  @override
+  State<_ProviderMapView> createState() => _ProviderMapViewState();
+}
+
+class _ProviderMapViewState extends State<_ProviderMapView> {
+  static const _initialCameraPosition = CameraPosition(
+    target: LatLng(_defaultLatitude, _defaultLongitude),
+    zoom: _defaultMapZoom,
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return GoogleMap(
+      initialCameraPosition: _initialCameraPosition,
+      markers: widget.markers,
+      onMapCreated: _handleMapCreated,
+      myLocationEnabled: widget.myLocationEnabled,
+      myLocationButtonEnabled: false,
+      trafficEnabled: false,
+      buildingsEnabled: false,
+      mapToolbarEnabled: false,
+      compassEnabled: false,
+      rotateGesturesEnabled: true,
+      tiltGesturesEnabled: false,
+      onTap: (_) => widget.onMapTap(),
+    );
+  }
+
+  void _handleMapCreated(GoogleMapController controller) {
+    widget.onMapCreated(controller);
+
+    if (widget.currentLocation != null) {
+      controller.moveCamera(CameraUpdate.newLatLngZoom(widget.currentLocation!, _markerZoomLevel));
+    }
+  }
+}
+
 class _FilterChipsList extends StatelessWidget {
   final MapProvidersCubit cubit;
   const _FilterChipsList({required this.cubit});
@@ -549,7 +590,6 @@ class _FilterChipsList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return BlocBuilder<MapProvidersCubit, MapProvidersState>(
-      // Only rebuild if selected types change
       buildWhen: (previous, current) {
         if (previous is MapProvidersLoaded && current is MapProvidersLoaded) {
           return previous.selectedTypes != current.selectedTypes;
@@ -605,11 +645,11 @@ class _FilterChipsList extends StatelessWidget {
         decoration: BoxDecoration(
           color: isSelected ? themeColor : Colors.white,
           borderRadius: BorderRadius.circular(20.r),
-          boxShadow: [
+          boxShadow: const [
             BoxShadow(
-              color: Colors.black.withOpacity(0.05),
+              color: Color(0x0F000000),
               blurRadius: 6,
-              offset: const Offset(0, 2),
+              offset: Offset(0, 2),
             ),
           ],
           border: isSelected ? null : Border.all(color: Colors.grey[200]!),
@@ -639,8 +679,7 @@ class _FilterChipsList extends StatelessWidget {
                     label,
                     style: TextStyle(
                       color: isSelected ? Colors.white : Colors.black87,
-                      fontWeight:
-                          isSelected ? FontWeight.w600 : FontWeight.w500,
+                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
                       fontSize: 12.sp,
                     ),
                   ),
@@ -666,16 +705,12 @@ class _LegendWidget extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white.withOpacity(0.96),
         borderRadius: BorderRadius.circular(16.r),
-        boxShadow: [
-          BoxShadow(
-              color: Colors.black12,
-              blurRadius: 16,
-              offset: const Offset(0, 4)),
+        boxShadow: const [
+          BoxShadow(color: Color(0x1F000000), blurRadius: 16, offset: Offset(0, 4)),
         ],
         border: Border.all(color: Colors.white.withOpacity(0.4)),
       ),
       child: BackdropFilter(
-        // Create glass effect
         filter: ui.ImageFilter.blur(sigmaX: 5, sigmaY: 5),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -686,20 +721,18 @@ class _LegendWidget extends StatelessWidget {
               children: [
                 Text(
                   context.tr('legend_title'),
-                  style:
-                      TextStyle(fontWeight: FontWeight.bold, fontSize: 13.sp),
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                 ),
                 InkWell(
                   onTap: onClose,
                   child: Padding(
                     padding: const EdgeInsets.all(4.0),
-                    child:
-                        Icon(Icons.close, size: 18.sp, color: Colors.grey[600]),
+                    child: Icon(Icons.close, size: 18, color: Colors.grey[600]),
                   ),
                 ),
               ],
             ),
-            Divider(height: 16.h),
+            const Divider(height: 16),
             ConstrainedBox(
               constraints: BoxConstraints(maxHeight: 200.h),
               child: SingleChildScrollView(
@@ -710,15 +743,12 @@ class _LegendWidget extends StatelessWidget {
                             padding: EdgeInsets.only(bottom: 10.h),
                             child: Row(
                               children: [
-                                Icon(e.value['icon'],
-                                    color: e.value['color'], size: 18.sp),
+                                Icon(e.value['icon'], color: e.value['color'], size: 18),
                                 SizedBox(width: 8.w),
                                 Expanded(
                                   child: Text(
                                     e.key,
-                                    style: TextStyle(
-                                        fontSize: 12.sp,
-                                        color: Colors.grey[800]),
+                                    style: TextStyle(fontSize: 12, color: Colors.grey[800]),
                                     overflow: TextOverflow.ellipsis,
                                   ),
                                 ),
@@ -772,15 +802,12 @@ class _ProviderDetailsSheet extends StatelessWidget {
               Container(
                 padding: EdgeInsets.all(12.w),
                 decoration: BoxDecoration(
-                  color: (_typeIconMap[provider.type]?['color'] ??
-                          Theme.of(context).primaryColor)
-                      .withOpacity(0.1),
+                  color: (_typeIconMap[provider.type]?['color'] ?? Theme.of(context).primaryColor).withOpacity(0.1),
                   borderRadius: BorderRadius.circular(16.r),
                 ),
                 child: Icon(
                   _typeIconMap[provider.type]?['icon'] ?? Icons.local_hospital,
-                  color: _typeIconMap[provider.type]?['color'] ??
-                      Theme.of(context).primaryColor,
+                  color: _typeIconMap[provider.type]?['color'] ?? Theme.of(context).primaryColor,
                   size: 32.sp,
                 ),
               ),
@@ -800,18 +827,14 @@ class _ProviderDetailsSheet extends StatelessWidget {
                     ),
                     SizedBox(height: 6.h),
                     Container(
-                      padding:
-                          EdgeInsets.symmetric(horizontal: 10.w, vertical: 4.h),
+                      padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 4.h),
                       decoration: BoxDecoration(
                         color: Colors.grey[100],
                         borderRadius: BorderRadius.circular(6.r),
                       ),
                       child: Text(
                         provider.type,
-                        style: TextStyle(
-                            color: Colors.grey[700],
-                            fontSize: 12.sp,
-                            fontWeight: FontWeight.w500),
+                        style: TextStyle(color: Colors.grey[700], fontSize: 12.sp, fontWeight: FontWeight.w500),
                       ),
                     ),
                   ],
@@ -821,16 +844,12 @@ class _ProviderDetailsSheet extends StatelessWidget {
           ),
 
           SizedBox(height: 24.h),
-          Divider(color: Colors.grey[100], height: 1),
+          const Divider(color: Color(0xFFE0E0E0), height: 1),
           SizedBox(height: 20.h),
 
           // Details
           _DetailRow(icon: Icons.place_outlined, text: provider.address),
-          if (provider.phone.isNotEmpty)
-            _DetailRow(
-                icon: Icons.phone_outlined,
-                text: provider.phone,
-                isPhone: true),
+          if (provider.phone.isNotEmpty) _DetailRow(icon: Icons.phone_outlined, text: provider.phone, isPhone: true),
           if (provider.discountPct.isNotEmpty)
             _DetailRow(
               icon: Icons.local_offer_outlined,
@@ -909,11 +928,7 @@ class _DetailRow extends StatelessWidget {
             Expanded(
               child: Text(
                 text,
-                style: TextStyle(
-                  fontSize: 14.sp,
-                  color: color,
-                  fontWeight: FontWeight.bold,
-                ),
+                style: TextStyle(fontSize: 14.sp, color: color, fontWeight: FontWeight.bold),
               ),
             ),
           ],
@@ -973,9 +988,7 @@ class _MainActionButton extends StatelessWidget {
         child: Container(
           padding: EdgeInsets.symmetric(vertical: 14.h),
           decoration: BoxDecoration(
-            border: isOutlined
-                ? Border.all(color: color.withOpacity(0.4), width: 1.5)
-                : null,
+            border: isOutlined ? Border.all(color: color.withOpacity(0.4), width: 1.5) : null,
             borderRadius: BorderRadius.circular(14.r),
           ),
           child: Row(
@@ -1004,27 +1017,21 @@ class _MainActionButton extends StatelessWidget {
 // ============================================================================
 
 class _MapIconCache {
-  // Static cache to persist across instances
   static final Map<String, BitmapDescriptor> _staticIconCache = {};
   static final Map<String, BitmapDescriptor> _staticSelectedIconCache = {};
   static bool _isGenerated = false;
 
   Future<void> generateTypeIcons(Map<String, Map<String, dynamic>> typeIconMap) async {
-    if (_isGenerated) return; // Return immediately if already generated
+    if (_isGenerated) return;
 
     try {
       final futures = <Future>[];
 
-      // Use Future.wait to run all generation in parallel on the event loop
-      // (Actually it's single threaded but platform channel calls are async)
-
-      // Defaults
       futures.add(_BitmapGenerator.create(Icons.location_on, Colors.blue, _iconSizeNormal)
           .then((icon) => _staticIconCache['default'] = icon));
       futures.add(_BitmapGenerator.create(Icons.location_on, Colors.blue, _iconSizeSelected, isSelected: true)
           .then((icon) => _staticSelectedIconCache['default'] = icon));
 
-      // Custom Types
       for (var entry in typeIconMap.entries) {
         final type = entry.key;
         final icon = entry.value['icon'] as IconData;
@@ -1047,80 +1054,45 @@ class _MapIconCache {
   BitmapDescriptor? getSelectedIcon(String type) => _staticSelectedIconCache[type];
   BitmapDescriptor? getDefaultIcon() => _staticIconCache['default'];
   BitmapDescriptor? getDefaultSelectedIcon() => _staticSelectedIconCache['default'];
-
-  void dispose() {
-    // We do NOT clear the static cache on dispose to keep them for next time
-  }
 }
 
 class _BitmapGenerator {
-  /// Generates a [BitmapDescriptor] from an icon.
-  /// Minimizes heavy painting operations.
-  static Future<BitmapDescriptor> create(
-      IconData icon, Color color, double size,
-      {bool isSelected = false}) async {
+  static Future<BitmapDescriptor> create(IconData icon, Color color, double size, {bool isSelected = false}) async {
     final ui.PictureRecorder recorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(recorder);
-    final double s = size;
-    final double center = s / 2;
+    final double center = size / 2;
 
-    // 1. Draw Shadow (Subtle)
-    // Reduce shadow blur for performance if needed, but keeping it for UX
-    final path = Path()
-      ..addOval(
-          Rect.fromCircle(center: Offset(center, center), radius: center - 4));
+    // Shadow
+    final path = Path()..addOval(Rect.fromCircle(center: Offset(center, center), radius: center - 4));
     canvas.drawShadow(path, Colors.black.withOpacity(0.25), 4.0, true);
 
-    // 2. Background
-    final Paint bgPaint = Paint()..color = isSelected ? color : Colors.white;
+    // Background
+    final bgPaint = Paint()..color = isSelected ? color : Colors.white;
     canvas.drawCircle(Offset(center, center), center - 4, bgPaint);
 
-    // 3. Border (Thicker for contrast)
-    final Paint borderPaint = Paint()
+    // Border
+    final borderPaint = Paint()
       ..color = isSelected ? Colors.white : color
       ..style = PaintingStyle.stroke
       ..strokeWidth = _iconBorderWidth;
     canvas.drawCircle(Offset(center, center), center - 6, borderPaint);
 
-    // 4. Icon
-    final TextPainter tp = TextPainter(textDirection: TextDirection.ltr);
+    // Icon
+    final tp = TextPainter(textDirection: TextDirection.ltr);
     tp.text = TextSpan(
       text: String.fromCharCode(icon.codePoint),
       style: TextStyle(
-        fontSize: s * 0.55,
+        fontSize: size * 0.55,
         fontFamily: icon.fontFamily,
         package: icon.fontPackage,
         color: isSelected ? Colors.white : color,
       ),
     );
     tp.layout();
-    tp.paint(canvas, Offset((s - tp.width) / 2, (s - tp.height) / 2));
+    tp.paint(canvas, Offset((size - tp.width) / 2, (size - tp.height) / 2));
 
-    final img = await recorder.endRecording().toImage(s.toInt(), s.toInt());
+    final img = await recorder.endRecording().toImage(size.toInt(), size.toInt());
     final data = await img.toByteData(format: ui.ImageByteFormat.png);
-    return BitmapDescriptor.fromBytes(data!.buffer.asUint8List());
-  }
-}
-
-class _LocationService {
-  static Future<LatLng?> getCurrentLocation() async {
-    try {
-      bool enabled = await Geolocator.isLocationServiceEnabled();
-      if (!enabled) return null;
-
-      LocationPermission p = await Geolocator.checkPermission();
-      if (p == LocationPermission.denied) {
-        p = await Geolocator.requestPermission();
-        if (p == LocationPermission.denied) return null;
-      }
-      if (p == LocationPermission.deniedForever) return null;
-
-      final pos = await Geolocator.getCurrentPosition(
-        timeLimit: const Duration(seconds: 5), // Fail fast
-      );
-      return LatLng(pos.latitude, pos.longitude);
-    } catch (_) {
-      return null;
-    }
+    return BitmapDescriptor.bytes(data!.buffer.asUint8List());
   }
 }
