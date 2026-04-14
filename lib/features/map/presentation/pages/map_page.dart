@@ -34,10 +34,10 @@ const double _iconBorderWidth = 1.0;
 Map<String, Map<String, dynamic>> _typeIconMap = {
   'صيدلية': {'icon': Icons.local_pharmacy, 'color': Colors.green},
   'مستشفى': {'icon': Icons.local_hospital, 'color': Colors.red},
-  'معمل تحاليل': {'icon': Icons.science, 'color': Colors.blue},
-  'مركز أشعة': {'icon': Icons.medical_services, 'color': Colors.deepPurple},
+  'معامل التحاليل': {'icon': Icons.science, 'color': Colors.blue},
+  'مراكز الأشعة': {'icon': Icons.medical_services, 'color': Colors.deepPurple},
   'علاج طبيعي': {'icon': Icons.accessibility_new, 'color': Colors.orange},
-  'مركز متخصص': {'icon': Icons.star, 'color': Colors.teal},
+  'مراكز متخصصة': {'icon': Icons.star, 'color': Colors.teal},
   'عيادة': {'icon': Icons.local_hospital, 'color': Colors.pink},
   'بصريات': {'icon': Icons.visibility, 'color': Colors.brown},
 };

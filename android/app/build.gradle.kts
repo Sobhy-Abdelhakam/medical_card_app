@@ -69,6 +69,9 @@ android {
             isShrinkResources = false
             signingConfig = signingConfigs.getByName("release")
         }
+        debug {
+            signingConfig = signingConfigs.getByName("release") // optional: use same key for debug builds
+        }
     }
 
     packagingOptions {

@@ -24,7 +24,7 @@ Returns a lightweight list for the home screen cards.
       "name_english": "AlBorg Labs",
       "name_arabic": "البرج",
       "type_en": "laboratory",
-      "type_ar": "معمل تحاليل",
+      "type_ar": "معامل التحاليل",
       "logo_url": "https://providers.euro-assist.com/uploads/logos/1753630875_البرج.png"
     },
     {
@@ -32,7 +32,7 @@ Returns a lightweight list for the home screen cards.
       "name_english": "Al-Mokhtabar",
       "name_arabic": "المختبر",
       "type_en": "laboratory",
-      "type_ar": "معمل تحاليل",
+      "type_ar": "معامل التحاليل",
       "logo_url": "https://providers.euro-assist.com/uploads/logos/1757333285_876a26cb-d50c-4dbb-931c-5d857e71a174.png"
     }
   ]
@@ -67,7 +67,7 @@ https://providers.euro-assist.com/api/arabic-providers?searchName=المختبر
     {
       "id": 2,
       "name": "المختبر",
-      "type": "معمل تحاليل",
+      "type": "معامل التحاليل",
       "address": "مدينة نصر - شارع الطيران",
       "district": "حي شرق مدينة نصر",
       "discount_pct": "خصم من 30% إلى 60%",
@@ -110,7 +110,7 @@ https://providers.euro-assist.com/api/arabic-providers?searchName=المختبر
     {
       "id": 301,
       "name": "المختبر",
-      "type": "معمل تحاليل",
+      "type": "معامل التحاليل",
       "address": "مدينة نصر - النادي الاهلي",
       "city": "القاهرة الكبري",
       "district": "حي شرق مدينة نصر",
@@ -122,7 +122,7 @@ https://providers.euro-assist.com/api/arabic-providers?searchName=المختبر
     {
       "id": 306,
       "name": "المختبر",
-      "type": "معمل تحاليل",
+      "type": "معامل التحاليل",
       "address": "احمد الزمر - الحي العاشر - مدينة نصر - محافظة القاهرة",
       "city": "القاهرة الكبري",
       "district": "حي شرق مدينة نصر",
@@ -134,7 +134,7 @@ https://providers.euro-assist.com/api/arabic-providers?searchName=المختبر
     {
       "id": 307,
       "name": "المختبر",
-      "type": "معمل تحاليل",
+      "type": "معامل التحاليل",
       "address": "63 شارع اسماء فهمي - ارض الجولف - مدينة نصر - القاهرة",
       "city": "القاهرة الكبري",
       "district": "حي شرق مدينة نصر",
@@ -193,7 +193,7 @@ Accept: application/json
     },
     {
       "name": "معمل التحاليل الحديث",
-      "type": "معمل تحاليل",
+      "type": "معامل التحاليل",
       "latitude": 29.9765,
       "longitude": 31.1313
     }
